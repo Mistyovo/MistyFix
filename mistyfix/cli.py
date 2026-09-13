@@ -20,6 +20,7 @@ from .patcher import Patcher
 from .sandbox import build_seccomp_stub, parse_syscall_list, rules_warning
 from .strategies import (
     PatchPlan,
+    RENAME_PRESETS,
     dynstr_rename,
     fix_read_length,
     true_fix_free,
@@ -121,8 +122,17 @@ def cmd_fix_free(args: argparse.Namespace) -> int:
 
 
 def cmd_rename(args: argparse.Namespace) -> int:
+    old, new = args.old, args.new
+    if args.preset:
+        try:
+            old, new, _desc = RENAME_PRESETS[args.preset]
+        except KeyError:
+            print(f"[!] 未知预设: {args.preset}", file=sys.stderr)
+            print("    可用预设:", ", ".join(sorted(RENAME_PRESETS)), file=sys.stderr)
+            return 2
+        print(f"[*] 使用预设 {args.preset}: {old} -> {new}")
     elf = ELFBinary(args.binary)
-    plan = dynstr_rename(elf, old=args.old, new=args.new)
+    plan = dynstr_rename(elf, old=old, new=new)
     _print_plan(plan)
     if not plan.applied:
         print("[!] 重命名未应用，未写出文件")
@@ -432,10 +442,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_fix_free.add_argument("-o", "--output", required=True, help="输出文件路径")
     p_fix_free.set_defaults(func=cmd_fix_free)
 
-    p_rename = sub.add_parser("rename", help=".dynstr 符号改名（如 free -> atoi，需等长）")
+    p_rename = sub.add_parser(
+        "rename", help=".dynstr 符号改名（如 free -> atoi，需等长）",
+        epilog="常用预设: " + ", ".join(f"{k} ({o}->{n})" for k, (o, n, _d)
+                                        in RENAME_PRESETS.items()),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p_rename.add_argument("binary", help="目标 ELF 文件")
     p_rename.add_argument("--old", default="free", help="原符号名（默认 free）")
     p_rename.add_argument("--new", default="atoi", help="新符号名（默认 atoi）")
+    p_rename.add_argument("--preset", default=None, metavar="KEY",
+                          help="使用内置预设（覆盖 --old/--new），见上方预设列表")
     p_rename.add_argument("-o", "--output", required=True, help="输出文件路径")
     p_rename.set_defaults(func=cmd_rename)
 

@@ -19,6 +19,7 @@ from mistyfix import (  # noqa: E402
     ComplianceChecker,
     ELFBinary,
     Patcher,
+    RENAME_PRESETS,
     diff_files,
     dynstr_rename,
     fix_read_length,
@@ -134,6 +135,23 @@ def main() -> int:
                 break
         else:
             check("obfuscated stub free of signatures (8 samples)", True)
+
+    print()
+    print("-- 改名预设 --")
+    check("预设表非空", len(RENAME_PRESETS) >= 8)
+    check("预设全部满足等长约束",
+          all(len(new) <= len(old) for old, new, _d in RENAME_PRESETS.values()))
+    check("预设符号均非空且不含空白",
+          all(old and new and " " not in old and " " not in new
+              for old, new, _d in RENAME_PRESETS.values()))
+    # CLI --preset 实际跑通（free2atoi 对样例成立）
+    from mistyfix.cli import main as cli_main
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "vuln.preset")
+        rc = cli_main(["rename", SAMPLE, "--preset", "free2atoi", "-o", out])
+        check("CLI rename --preset free2atoi 成功", rc == 0 and os.path.isfile(out))
+        rc2 = cli_main(["rename", SAMPLE, "--preset", "no_such", "-o", out])
+        check("CLI rename 未知预设报错退出", rc2 == 2)
 
     print()
     if _failures:

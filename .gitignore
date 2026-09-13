@@ -17,3 +17,6 @@ tmp/*
 flags.txt
 exp.py
 traffic_capture.log
+
+# PyInstaller 自动生成的 spec（便携构建入口见 build_release.py）
+*.spec

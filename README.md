@@ -57,7 +57,7 @@ GUI 在 CLI 之上的增强：
 - **自动定位调用点**：一键扫描 `call read@plt` / `call free@plt` 的全部位置，不用手动找地址；
 - **叠加修复**：默认开启「修复后自动加载产物」，修复产物自动成为目标文件，可直接切到其他标签页继续叠加（如先修 read 再修 free），无需手动重载；
 - **指令预览**：点击清单行自动显示其前后反汇编（目标指令高亮）；
-- **实时参数校验**：如符号改名页的等长校验（过长立即红色提示）、地址栏支持 `0x` 前缀 / 十进制 / 纯十六进制；
+- **实时参数校验**：符号改名页内置 10 个常用危险函数改名预设（system→printf 等）+ 等长校验 + `.dynstr` 符号存在性预检，地址栏支持 `0x` 前缀 / 十进制 / 纯十六进制；
 - **合规检测表格**：7 项检测 PASS/FAIL/WARN 彩色分栏显示，每次修复保存后自动检测并回填；
 - **内置交互脚本编辑器**：功能测试 / exp 复验无需单独建文件，直接在 GUI 里写 `recvuntil`/`sendline` 脚本运行；
 - **后台执行 + 彩色日志**：所有耗时操作后台线程执行界面不卡死，底部类终端日志区统一记录（可导出）；
@@ -109,9 +109,28 @@ mistyfix fix-free ./vuln 0x4012c0 --ptr 0x404060 -o ./vuln.fix
 ```bash
 mistyfix rename ./vuln -o ./vuln.fix            # 默认 free -> atoi
 mistyfix rename ./vuln --old system --new atoi -o ./vuln.fix
+mistyfix rename ./vuln --preset system2printf -o ./vuln.fix    # 使用内置预设
 ```
 
 等长改写 `.dynstr` 中的符号名（要求新旧名字等长），将危险函数替换为无害函数，改数据不改控制流。
+
+**内置常用预设**（`--preset KEY`，GUI 改名页可直接下拉选择）：
+
+| 预设 | 改名 | 说明 |
+|---|---|---|
+| `system2printf` | system → printf | 命令执行变打印，经典通杀 system 漏洞 |
+| `system2strlen` | system → strlen | 命令执行变取长度（返回值近似可用） |
+| `free2atoi` | free → atoi | 释放变整数解析（默认方案） |
+| `gets2atoi` | gets → atoi | 停止读入，解析旧缓冲区内容 |
+| `gets2puts` | gets → puts | 读入变打印，不再写入缓冲区 |
+| `scanf2puts` | scanf → puts | 停止读入，格式串原样打印 |
+| `strcpy2strlen` | strcpy → strlen | 停止拷贝，消除溢出源 |
+| `strcat2strlen` | strcat → strlen | 停止拼接，消除溢出源 |
+| `execve2printf` | execve → printf | 停止执行外部程序 |
+| `popen2fopen` | popen → fopen | 命令执行变文件打开（等长且返回同为 FILE*） |
+
+所有预设均满足等长约束；改名会改变正常业务流程（这是改数据修复的代价）。
+GUI 还会在改名前做**符号存在性预检**——目标符号不在当前二进制 `.dynstr` 时直接标红提示。
 
 ### check —— 合规性对比
 

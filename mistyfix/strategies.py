@@ -22,6 +22,33 @@ __all__ = [
 
 SUPPORTED_ARCHES = ("amd64", "i386")
 
+# ---------------------------------------------------------------------------
+# 常用符号改名预设：危险函数 -> 等长/更短的无害函数（.dynstr 原地改写）
+# ---------------------------------------------------------------------------
+#: key -> (原符号, 新符号, 一句话说明)。全部满足 len(new) <= len(old)。
+#: 语义：动态链接器会把对原函数的调用绑定到新函数——正常业务流程会被
+#: 改变（这是改数据修复的代价），但漏洞利用路径被掐断。
+RENAME_PRESETS: dict[str, tuple[str, str, str]] = {
+    "system2printf": ("system", "printf", "命令执行变打印，经典通杀 system 漏洞"),
+    "system2strlen": ("system", "strlen", "命令执行变取长度（返回值近似可用）"),
+    "free2atoi": ("free", "atoi", "释放变整数解析（默认方案）"),
+    "gets2atoi": ("gets", "atoi", "停止读入，解析旧缓冲区内容"),
+    "gets2puts": ("gets", "puts", "读入变打印，不再写入缓冲区"),
+    "scanf2puts": ("scanf", "puts", "停止读入，格式串原样打印"),
+    "strcpy2strlen": ("strcpy", "strlen", "停止拷贝，消除溢出源"),
+    "strcat2strlen": ("strcat", "strlen", "停止拼接，消除溢出源"),
+    "execve2printf": ("execve", "printf", "停止执行外部程序"),
+    "popen2fopen": ("popen", "fopen", "命令执行变文件打开（等长且返回同为 FILE*）"),
+}
+
+
+def rename_preset_by_symbol(old: str) -> tuple[str, str] | None:
+    """按原符号名返回推荐预设 (old, new)；无匹配返回 None。"""
+    for _key, (o, n, _desc) in RENAME_PRESETS.items():
+        if o == old:
+            return o, n
+    return None
+
 
 @dataclass
 class PatchPlan:

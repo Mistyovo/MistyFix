@@ -10,6 +10,7 @@ from .elf_utils import Cave, ELFBinary, SectionInfo, diff_files
 from .patcher import PatchError, Patcher
 from .strategies import (
     PatchPlan,
+    RENAME_PRESETS,
     dynstr_rename,
     fix_int_compare,
     fix_read_length,
@@ -28,6 +29,7 @@ __all__ = [
     "PatchError",
     "Patcher",
     "PatchPlan",
+    "RENAME_PRESETS",
     "fix_read_length",
     "true_fix_free",
     "dynstr_rename",

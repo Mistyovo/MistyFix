@@ -34,6 +34,7 @@ if __package__ in ("mistyfix", None):  # 作为包模块导入
     from .sandbox import build_seccomp_stub, parse_syscall_list, rules_warning
     from .strategies import (
         PatchPlan,
+        RENAME_PRESETS,
         dynstr_rename,
         fix_int_compare,
         fix_read_length,
@@ -49,6 +50,7 @@ else:  # python mistyfix/gui.py 直接运行
     from mistyfix.sandbox import build_seccomp_stub, parse_syscall_list, rules_warning
     from mistyfix.strategies import (
         PatchPlan,
+        RENAME_PRESETS,
         dynstr_rename,
         fix_int_compare,
         fix_read_length,
@@ -807,8 +809,21 @@ class MistyFixGUI:
         card = ttk.Frame(tab, style="Card.TFrame", padding=14)
         card.pack(fill="both", expand=True)
         ttk.Label(card, text="等长改写 .dynstr 符号名（如 free → atoi），改数据不改控制流，"
-                             "不触碰 GOT。新名必须不长于旧名，不足补 NUL。",
+                             "不触碰 GOT。新名必须不长于旧名，不足补 NUL。可直接选常用方案。",
                   style="DimCard.TLabel").pack(anchor="w", pady=(0, 10))
+
+        self.rename_preset_var = tk.StringVar()
+        self._preset_values = [f"{o} → {n}｜{d}" for _k, (o, n, d) in RENAME_PRESETS.items()]
+
+        def _make_preset_combo(row: ttk.Frame) -> ttk.Combobox:
+            cb = ttk.Combobox(row, textvariable=self.rename_preset_var,
+                              values=self._preset_values, state="readonly", width=44)
+            cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_rename_preset())
+            return cb
+
+        self._form_row(card, "常用方案", _make_preset_combo)
+        ttk.Label(card, text="内置危险函数改名预设；也可在下方手动填任意等长替换",
+                  style="DimCard.TLabel").pack(fill="x", padx=(96, 0), pady=(0, 4))
 
         self.rename_old_var = tk.StringVar(value="free")
         self.rename_new_var = tk.StringVar(value="atoi")
@@ -829,6 +844,17 @@ class MistyFixGUI:
         ttk.Button(card, text="执行改名", style="Accent.TButton",
                    command=self.run_rename).pack(anchor="w", padx=(96, 0), pady=(10, 0))
 
+    def _apply_rename_preset(self) -> None:
+        """把选中的常用方案填入原/新符号名（校验由变量 trace 自动触发）。"""
+        try:
+            idx = self._preset_values.index(self.rename_preset_var.get())
+        except ValueError:
+            return
+        _key, (old, new, _desc) = list(RENAME_PRESETS.items())[idx]
+        self.rename_old_var.set(old)
+        self.rename_new_var.set(new)
+        self.log("dim", f"已应用改名预设: {old} -> {new}")
+
     def _validate_rename(self) -> None:
         old, new = self.rename_old_var.get(), self.rename_new_var.get()
         if not old or not new:
@@ -837,10 +863,18 @@ class MistyFixGUI:
         if len(new) > len(old):
             self.rename_hint.config(
                 text=f"✗ 新名 {len(new)}B 长于旧名 {len(old)}B，无法等长替换", foreground=_FAIL)
-        else:
-            pad = len(old) - len(new)
-            extra = f"，将补 {pad} 个 NUL" if pad else "（等长）"
-            self.rename_hint.config(text=f"✓ 可以等长替换{extra}", foreground=_PASS)
+            return
+        pad = len(old) - len(new)
+        parts = [f"✓ 可以等长替换" + (f"，将补 {pad} 个 NUL" if pad else "（等长）")]
+        color = _PASS
+        if self.elf:
+            # 符号存在性预检：改名目标不在 .dynstr 里必然失败
+            if self.elf.dynstr_offset(old) is not None:
+                parts.append(f"✓ {old!r} 存在于当前二进制 .dynstr")
+            else:
+                parts.append(f"✗ 当前二进制 .dynstr 中没有 {old!r}，改名会失败")
+                color = _FAIL
+        self.rename_hint.config(text="；".join(parts), foreground=color)
 
     def run_rename(self) -> None:
         if not self._require_elf() or self._require_idle():
@@ -1454,6 +1488,7 @@ class MistyFixGUI:
         self._update_action_btn(self.free_run_btn, self.free_sites)
         for pane in (self.read_preview, self.free_preview):
             self._render_preview(pane, None)
+        self._validate_rename()  # 符号存在性预检随新二进制更新
 
         self.log("ok", f"[+] 已加载 {path}（{elf.arch}，入口 {_fmt_hex(elf.entry_vaddr(), 6)}，"
                        f"{len(elf.data):,} 字节，{len(sections)} 节，{len(caves)} 个 cave）")

@@ -179,6 +179,26 @@ def main() -> int:
     root.update()
     check("超长校验拦截", app.rename_hint.cget("text").startswith("✗"))
 
+    print("== 改名预设 ==")
+    # 重载含 free 符号的二进制（此前自动链已加载 rename 产物，free 已被改写）
+    app.autochain_var.set(False)
+    app._set_binary_path(str(out_free))
+    app.load_binary()
+    wait_idle(app)
+    keys = list(gui_mod.RENAME_PRESETS.keys())
+    # free2atoi：样例含 free 符号 → 应用并命中存在性检查
+    app.rename_preset_var.set(app._preset_values[keys.index("free2atoi")])
+    app._apply_rename_preset()
+    check("预设回填 old/new", app.rename_old_var.get() == "free"
+          and app.rename_new_var.get() == "atoi")
+    check("存在性预检通过", "存在于当前二进制" in app.rename_hint.cget("text"))
+    # system2printf：样例无 system 符号 → 预检标红（顺带验证带 %s 之外的预设不影响）
+    app.rename_preset_var.set(app._preset_values[keys.index("system2printf")])
+    app._apply_rename_preset()
+    root.update()
+    check("无符号时预检警告", "没有" in app.rename_hint.cget("text"))
+    app.autochain_var.set(True)
+
     print("== fix-cmp（样例仅有 3D 短格式 cmp，验证拒绝路径）==")
     # 样例中 `cmp rax, 0x404040` 为 0x3D 短格式，核心策略仅支持 0x80/81/83，
     # 应走「修复未应用」路径：弹窗警告（已被拦截）且不写出文件

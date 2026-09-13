@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from mistyfix.elf_utils import ELFBinary
+from mistyfix.elf_utils import ELFBinary, Cave
 from mistyfix.patcher import Patcher, PatchError
 
 __all__ = [
@@ -276,34 +276,48 @@ def true_fix_free(patcher: Patcher, call_vaddr: int, ptr_vaddr: int | None = Non
         if not insns or not insns[0][1].lower().startswith("call"):
             got = insns[0][1] if insns else "<nothing>"
             return _fail(f"true_fix_free: expected a call at 0x{call_vaddr:x}, found {got!r}")
-        stolen = (insns[1][0] - call_vaddr) if len(insns) > 1 else 5
 
         # stub 自己完成 call free，原 call 指令（E8 rel32，位置相关）不能照搬重放。
-        # PIE 的 rel32 call 依赖 stub 落点地址，先按探针长度选 cave，再按 cave
-        # 地址汇编最终 stub（指令定长，两阶段长度一致）。
+        # rel32 call / RIP 相对置空都以 stub 落点为基汇编，先按探针选落点再生成
+        # 最终 stub（指令定长，两阶段长度一致）。
         probe = _build_free_stub(patcher, free_plt, ptr_vaddr, stub_vaddr=0, pie=pie)
-        needed = len(probe) + 5
-        candidates = patcher.elf.caves(min_size=needed)
-        if not candidates:
-            return _fail(
-                f"true_fix_free: no code cave large enough ({needed} bytes) for the stub"
-            )
-        cave = candidates[0]
-        stub = _build_free_stub(patcher, free_plt, ptr_vaddr,
-                                stub_vaddr=cave.vaddr, pie=pie)
-        cave_vaddr = patcher.build_trampoline(
-            call_vaddr, stub, stolen=stolen, resteal=False, cave=cave)
+        from mistyfix.injector import apply_stub_space, plan_stub_space
+        space = plan_stub_space(patcher.elf, len(probe) + 5)  # +5: 跳回 jmp
+
+        if space.method == "cave":
+            stub = _build_free_stub(patcher, free_plt, ptr_vaddr,
+                                    stub_vaddr=space.stub_vaddr, pie=pie)
+            cave_vaddr = patcher.build_trampoline(
+                call_vaddr, stub, stolen=5, resteal=False,
+                cave=Cave(section=space.method, file_offset=space.stub_file_off,
+                          vaddr=space.stub_vaddr, size=space.stub_len))
+            used_tail = False
+        else:
+            # 无 cave 二进制：段尾 padding 注入（扩容段头 16 字节）+ 手工 trampoline
+            stolen = patcher._boundary_size(call_vaddr, 5)
+            stub = _build_free_stub(patcher, free_plt, ptr_vaddr,
+                                    stub_vaddr=space.stub_vaddr, pie=pie)
+            back_src = space.stub_vaddr + len(stub)
+            payload = stub + patcher.jmp_opcode(back_src, call_vaddr + stolen)
+            apply_stub_space(patcher, space, payload)
+            patcher.patch_bytes(call_vaddr,
+                                patcher.jmp_opcode(call_vaddr, space.stub_vaddr))
+            cave_vaddr = space.stub_vaddr
+            used_tail = True
     except Exception as e:  # noqa: BLE001
         return _fail(f"true_fix_free: {type(e).__name__}: {e}")
 
-    call_style = "rel32 call (PIE, base = cave)" if pie else "abs call via rax"
+    call_style = "rel32 call (PIE, base = stub)" if pie else "abs call via rax"
     changes = [
-        f"hook 0x{call_vaddr:x}: call free@plt -> jmp cave 0x{cave_vaddr:x} ({stolen} bytes hooked)",
-        f"cave 0x{cave_vaddr:x}: save rax/rcx/rdx/rdi (keeps 16-byte stack alignment) -> "
-        f"{call_style} free@plt (0x{free_plt:x})"
+        f"hook 0x{call_vaddr:x}: call free@plt -> jmp stub 0x{cave_vaddr:x} ({stolen if used_tail else 5} bytes hooked)",
+        f"{'tail padding' if used_tail else 'cave'} 0x{cave_vaddr:x}: save rax/rcx/rdx/rdi "
+        f"(keeps 16-byte stack alignment) -> {call_style} free@plt (0x{free_plt:x})"
         + (f" -> null pointer at 0x{ptr_vaddr:x} (UAF fix)" if ptr_vaddr is not None else "")
         + " -> restore -> jmp back (original call instruction replaced by the stub, not re-executed)",
-        "free is genuinely called (no NOP); injected into existing code cave, section table/file size unchanged",
+        "free is genuinely called (no NOP); file size unchanged"
+        + ("; injected into tail padding with p_filesz/p_memsz grown (16 header bytes changed, "
+           "no cave was available)" if used_tail
+           else "; injected into existing code cave, section table/file size unchanged"),
     ]
     if ptr_vaddr is not None:
         changes.append(
@@ -312,7 +326,8 @@ def true_fix_free(patcher: Patcher, call_vaddr: int, ptr_vaddr: int | None = Non
                else "absolute addressing (non-PIE fixed address)"))
     return PatchPlan(
         description=(
-            f"true-fix free at 0x{call_vaddr:x} via trampoline to cave 0x{cave_vaddr:x}"
+            f"true-fix free at 0x{call_vaddr:x} via trampoline to "
+            f"{'tail-padding stub' if used_tail else 'cave stub'} 0x{cave_vaddr:x}"
             + (f", nulls pointer at 0x{ptr_vaddr:x}" if ptr_vaddr is not None else "")
             + (" [PIE]" if pie else "")
         ),

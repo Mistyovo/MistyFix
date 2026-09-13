@@ -192,6 +192,37 @@ def main() -> int:
         check("traffic dry-run 计划成功(e_entry)", False, str(exc)[:80])
 
     print()
+    print("== .plt.sec 布局 + 无 cave 段尾兜底（tests/pwn_pltsec）==")
+    PWN = os.path.join(os.path.dirname(__file__), "pwn_pltsec")
+    if os.path.isfile(PWN):
+        pe = ELFBinary(PWN)
+        check("识别 .plt.sec（CET/IBT）布局", pe._get_section(".plt.sec") is not None)
+        check("识别 full RELRO（无 .got.plt）", pe._get_section(".got.plt") is None)
+        check("read PLT 入口指向 .plt.sec", pe.plt_stub_addr("read") == 0x10f0,
+              hex(pe.plt_stub_addr("read")))
+        reads = pe.find_calls_to("read")
+        frees = pe.find_calls_to("free")
+        check("扫描 read 调用点（4 处）", len(reads) == 4, [hex(a) for a in reads])
+        check("扫描 free 调用点（1 处）", len(frees) == 1, [hex(a) for a in frees])
+        check("扫描 scanf 调用点（1 处）", len(pe.find_calls_to("__isoc99_scanf")) == 1)
+        check("该二进制无 code cave", len(pe.caves(min_size=16)) == 0)
+        pp = Patcher(ELFBinary(PWN))
+        plan = true_fix_free(pp, frees[0], None)
+        check("无 cave 时段尾兜底注入成功", plan.applied and "tail-padding" in plan.description,
+              plan.description[:70])
+        outp = os.path.join(td, "pwn.fixfree")
+        pp.save(outp)
+        ok, detail = compliance_all(PWN, outp)
+        check("合规检测全部通过（含 .got 回退比对）", ok, detail[:90])
+        po = ELFBinary(outp)
+        o_exec = max(pe.exec_load_segments(), key=lambda s: s[2])
+        n_exec = max(po.exec_load_segments(), key=lambda s: s[2])
+        check("段头 p_filesz 已扩容", n_exec[3] > o_exec[3],
+              f"0x{o_exec[3]:x} -> 0x{n_exec[3]:x}")
+    else:
+        print("  [SKIP] 无 tests/pwn_pltsec 样例")
+
+    print()
     if _failures:
         print(f"[!] {len(_failures)} 项失败: {_failures}")
         return 1

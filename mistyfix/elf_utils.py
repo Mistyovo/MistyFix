@@ -228,15 +228,21 @@ class ELFBinary:
                 return base + idx
             start = idx + 1
 
-    def plt_stub_addr(self, func_name: str) -> int | None:
-        """func@plt 的 vaddr。"""
-        sec = self._get_section(".plt")
-        if sec is None:
-            return None
+    def plt_stub_addrs(self, func_name: str) -> list[int]:
+        """func 全部 PLT 入口候选的 vaddr。
+
+        覆盖三种现代布局：
+        - ``.plt.sec``（CET/IBT，gcc -fcf-protection 默认产物）：与
+          ``.rela.plt`` 顺序一一对应，每项 16B、无 PLT0 头；
+        - 传统 ``.plt``：PLT0 头 16B + 每项 16B（惰性绑定路径，仍可调用）；
+        - ``.plt.got``：GLOB_DAT 立即绑定符号（-z now），扫描 8/16B stub
+          中 ``jmp [rip+disp]`` 解析到该符号 GOT 槽的入口。
+        """
+        out: list[int] = []
         try:
             relocations = list(self._binary.pltgot_relocations)
         except Exception:
-            return None
+            return []
         names: list[str] = []
         for r in relocations:
             if r.has_symbol and r.symbol:
@@ -246,18 +252,58 @@ class ELFBinary:
         try:
             idx = names.index(func_name)
         except ValueError:
-            return None
-        if self.arch == "amd64":
-            # .plt: 1 个头 stub (16B) + 每项 16B
-            return sec.virtual_address + 16 * (idx + 1)
-        else:
-            # i386: .plt 头 16B + 每项 16B（标准布局）
-            return sec.virtual_address + 16 * (idx + 1)
+            idx = -1
+
+        # .plt.sec：现代调用目标（.text 里的 call 指向这里）
+        sec = self._get_section(".plt.sec")
+        if sec is not None and idx >= 0:
+            out.append(sec.virtual_address + 16 * idx)
+        # 传统 .plt：惰性绑定回退
+        sec = self._get_section(".plt")
+        if sec is not None and idx >= 0:
+            out.append(sec.virtual_address + 16 * (idx + 1))
+
+        # .plt.got：GLOB_DAT 立即绑定符号
+        got_slot = None
+        try:
+            for r in self._binary.relocations:
+                if (r.has_symbol and r.symbol and r.symbol.name == func_name
+                        and "GLOB_DAT" in str(r.type)):
+                    got_slot = r.address
+                    break
+        except Exception:
+            got_slot = None
+        if got_slot is not None:
+            sec = self._get_section(".plt.got")
+            if sec is not None:
+                from capstone.x86_const import X86_OP_MEM, X86_REG_RIP
+                md = Cs(CS_ARCH_X86, CS_MODE_64 if self.arch == "amd64" else CS_MODE_32)
+                md.detail = True
+                prev_addr: int | None = None
+                for i in md.disasm(bytes(sec.content), sec.virtual_address):
+                    if i.mnemonic.startswith("jmp"):
+                        for op in i.operands:
+                            if op.type == X86_OP_MEM and op.mem.base == X86_REG_RIP:
+                                if i.address + i.size + op.mem.disp == got_slot:
+                                    # 入口起点为紧邻的 endbr64（无则即 jmp 自身）
+                                    out.append(prev_addr if prev_addr is not None
+                                                else i.address)
+                    prev_addr = i.address
+        return out
+
+    def plt_stub_addr(self, func_name: str) -> int | None:
+        """func@plt 的 vaddr（.plt.sec 优先，兼容传统 .plt / .plt.got）。"""
+        addrs = self.plt_stub_addrs(func_name)
+        return addrs[0] if addrs else None
 
     def find_calls_to(self, func_name: str) -> list[int]:
-        """反汇编所有可执行节，找 `call func@plt` 指令的 vaddr。"""
-        target = self.plt_stub_addr(func_name)
-        if target is None:
+        """反汇编所有可执行节，找 `call func@plt` 指令的 vaddr。
+
+        匹配该符号的全部 PLT 入口候选（.plt.sec / .plt / .plt.got），
+        以兼容 CET/IBT 与立即绑定等现代链接布局。
+        """
+        targets = set(self.plt_stub_addrs(func_name))
+        if not targets:
             return []
         mode = CS_MODE_64 if self.arch == "amd64" else CS_MODE_32
         md = Cs(CS_ARCH_X86, mode)
@@ -274,7 +320,7 @@ class ELFBinary:
                         dst = int(insn.op_str, 0)
                     except ValueError:
                         continue
-                    if dst == target:
+                    if dst in targets:
                         hits.append(insn.address)
         return hits
 

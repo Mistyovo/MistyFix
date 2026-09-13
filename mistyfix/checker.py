@@ -22,9 +22,9 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 try:
-    from .elf_utils import ELFBinary, diff_files
+    from .elf_utils import ELFBinary, ELFError, diff_files
 except ImportError:  # 允许在包外直接调试本模块
-    from elf_utils import ELFBinary, diff_files  # type: ignore[no-redef]
+    from elf_utils import ELFBinary, ELFError, diff_files  # type: ignore[no-redef]
 
 try:
     import capstone  # type: ignore[import-not-found]
@@ -126,16 +126,30 @@ class ComplianceChecker:
         return CheckResult(name, True, f"{len(orig_secs)} 个节的 name/vaddr/size 全部一致")
 
     def check_got_plt(self) -> CheckResult:
-        """.got.plt 内容必须逐字节一致（AWDP 检测手段 3）。"""
+        """.got.plt 内容必须逐字节一致（AWDP 检测手段 3）。
+
+        全 RELRO（-z now）二进制没有 .got.plt，退回比对 .got；
+        两者皆无（如静态二进制）则视为无需比对。
+        """
         name = "check_got_plt"
-        a = self.orig.got_plt_bytes()
-        b = self.patched.got_plt_bytes()
+        try:
+            a = self.orig.got_plt_bytes()
+            b = self.patched.got_plt_bytes()
+            label = ".got.plt"
+        except ELFError:
+            try:
+                a = self.orig.section_data(".got")
+                b = self.patched.section_data(".got")
+                label = ".got（无 .got.plt，full RELRO）"
+            except ELFError:
+                return CheckResult(name, True, "无 .got.plt/.got（无需比对）")
         if a == b:
-            return CheckResult(name, True, f".got.plt 一致（{len(a)} 字节）")
+            return CheckResult(name, True, f"{label} 一致（{len(a)} 字节）")
         diffs = [i for i in range(min(len(a), len(b))) if a[i] != b[i]]
         if len(a) != len(b):
-            return CheckResult(name, False, f".got.plt 长度改变: {len(a)} -> {len(b)}")
-        return CheckResult(name, False, f".got.plt 有 {len(diffs)} 字节不同，首个偏移 {diffs[0]:#x}")
+            return CheckResult(name, False, f"{label} 长度改变: {len(a)} -> {len(b)}")
+        return CheckResult(name, False,
+                           f"{label} 有 {len(diffs)} 字节不同，首个偏移 {diffs[0]:#x}")
 
     def check_start(self) -> CheckResult:
         """_start 入口机器码必须一致（AWDP 检测手段 4）。"""

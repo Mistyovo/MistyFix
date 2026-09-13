@@ -35,6 +35,19 @@ class InstallError(Exception):
 
 
 @dataclass
+class StubSpace:
+    """stub 落点空间计划（与 hook 方式无关，可被修复策略复用）。"""
+    method: str                 # "cave" / "tail"
+    stub_vaddr: int
+    stub_file_off: int
+    stub_len: int
+    need_phdr_grow: bool = False
+    phdr_off: int | None = None
+    new_filesz: int = 0
+    new_memsz: int = 0
+
+
+@dataclass
 class InstallPlan:
     method: str                 # "cave+init_array" / "tail+init_array" / "cave+entry" / "tail+entry"
     stub_vaddr: int             # stub 链接视图虚拟地址
@@ -65,10 +78,91 @@ class InstallPlan:
         return "\n".join(lines)
 
 
-def plan_install(elf: ELFBinary, stub_len: int) -> InstallPlan:
-    """为长 stub_len 的机器码选择落点与 hook 点。找不到时抛 InstallError。"""
+def plan_stub_space(elf: ELFBinary, stub_len: int) -> StubSpace:
+    """为长 stub_len 的机器码选择落点：cave 优先，段尾 padding 扩容兜底。"""
     if stub_len <= 0:
         raise InstallError("stub 长度必须为正")
+
+    caves = elf.caves(min_size=stub_len)
+    if caves:
+        cave = caves[0]  # .eh_frame 优先（caves() 内部已排序）
+        return StubSpace(method="cave", stub_vaddr=cave.vaddr,
+                         stub_file_off=cave.file_offset, stub_len=stub_len)
+
+    all_segs = elf.load_segments_sorted()
+    for phdr_idx, off, vaddr, filesz, memsz, _flags in reversed(elf.exec_load_segments()):
+        inject_off = off + filesz
+        # 下一个段（任意类型）的文件起点，注入不得越过它
+        next_off = len(elf.data)
+        next_vaddr = None
+        for _s_idx, s_off, s_vaddr, _fsz, _msz, _fl in all_segs:
+            if s_off > off:
+                next_off = min(next_off, s_off)
+                if next_vaddr is None or s_vaddr < next_vaddr:
+                    next_vaddr = s_vaddr
+        if next_off - inject_off < stub_len:
+            continue
+        inject_vaddr = vaddr + filesz
+        # vaddr 侧不得与相邻段重叠
+        if next_vaddr is not None and inject_vaddr + stub_len > next_vaddr:
+            continue
+
+        return StubSpace(
+            method="tail", stub_vaddr=inject_vaddr, stub_file_off=inject_off,
+            stub_len=stub_len, need_phdr_grow=True,
+            phdr_off=elf.phoff + phdr_idx * elf.phentsize,
+            new_filesz=filesz + stub_len, new_memsz=max(memsz, filesz + stub_len))
+
+    raise InstallError(
+        f"没有可用落点：无 ≥{stub_len} 字节的 code cave，可执行段尾 padding 也放不下")
+
+
+def grow_segment(elf: ELFBinary, phdr_off: int, new_filesz: int, new_memsz: int) -> None:
+    """扩容 PT_LOAD 的 p_filesz/p_memsz 并同步 ELFBinary 的段映射缓存。
+
+    缓存不同步的话，同会话内的后续注入（批量修复第二个 stub）会按旧
+    filesz 规划，落点与本次注入区重叠。
+    """
+    width = 8 if elf.arch == "amd64" else 4
+    if width == 8:  # Elf64_Phdr: p_filesz@32, p_memsz@40
+        struct.pack_into("<Q", elf.data, phdr_off + 32, new_filesz)
+        struct.pack_into("<Q", elf.data, phdr_off + 40, new_memsz)
+    else:           # Elf32_Phdr: p_filesz@16, p_memsz@20
+        struct.pack_into("<I", elf.data, phdr_off + 16, new_filesz)
+        struct.pack_into("<I", elf.data, phdr_off + 20, new_memsz)
+
+    # 同步 phdr_entries / _segments 缓存（按 phdr_off 反查段索引）
+    idx = (phdr_off - elf.phoff) // elf.phentsize
+    for i, (p_idx, off, va, filesz, memsz, flags) in enumerate(elf.phdr_entries):
+        if p_idx != idx:
+            continue
+        elf.phdr_entries[i] = (p_idx, off, va, new_filesz, new_memsz, flags)
+        for j, (o2, v2, f2, fl2) in enumerate(elf._segments):
+            if o2 == off and v2 == va:
+                elf._segments[j] = (o2, v2, max(f2, new_filesz), fl2)
+
+
+def apply_stub_space(patcher: Patcher, space: StubSpace, payload: bytes) -> int:
+    """把 payload 写到计划落点（tail 时扩容段头）。返回落点 vaddr。
+
+    payload 允许比 space.stub_len 短（混淆变体随机长度），但不得更长。
+    """
+    elf = patcher.elf
+    if len(payload) > space.stub_len:
+        raise InstallError(
+            f"payload 长度超出计划: {len(payload)} > {space.stub_len}")
+    elf.data[space.stub_file_off : space.stub_file_off + len(payload)] = payload
+    patcher.log.append(
+        f"inject {len(payload)}B at 0x{space.stub_vaddr:x} "
+        f"(file 0x{space.stub_file_off:x}, {space.method})")
+    if space.need_phdr_grow and space.phdr_off is not None:
+        grow_segment(elf, space.phdr_off, space.new_filesz, space.new_memsz)
+    return space.stub_vaddr
+
+
+def plan_install(elf: ELFBinary, stub_len: int) -> InstallPlan:
+    """为长 stub_len 的机器码选择落点与 hook 点。找不到时抛 InstallError。"""
+    space = plan_stub_space(elf, stub_len)
 
     notes: list[str] = []
     # ---- hook 点选择 --------------------------------------------------
@@ -95,58 +189,20 @@ def plan_install(elf: ELFBinary, stub_len: int) -> InstallPlan:
     if hook_off is None:
         hook_off, hook_orig, hook_label = elf.entry_header_offset(), elf.entry_vaddr(), "e_entry"
 
-    # ---- 落点选择：cave 优先 -------------------------------------------
-    caves = elf.caves(min_size=stub_len)
-    if caves:
-        cave = caves[0]  # .eh_frame 优先（caves() 内部已排序）
-        return InstallPlan(
-            method=f"cave+{'init_array' if hook_label == '.init_array[0]' else 'entry'}",
-            stub_vaddr=cave.vaddr,
-            stub_file_off=cave.file_offset,
-            stub_len=stub_len,
-            hook_off=hook_off, hook_label=hook_label, hook_orig_value=hook_orig,
-            need_phdr_grow=False, phdr_off=None, notes=notes)
-
-    # ---- 兜底：段尾 padding 注入 + p_filesz/p_memsz 扩容 -----------------
-    all_segs = elf.load_segments_sorted()
-    for phdr_idx, off, vaddr, filesz, memsz, _flags in reversed(elf.exec_load_segments()):
-        inject_off = off + filesz
-        # 下一个段（任意类型）的文件起点，注入不得越过它
-        next_off = len(elf.data)
-        next_vaddr = None
-        for s_idx, s_off, s_vaddr, _fsz, _msz, _fl in all_segs:
-            if s_off > off:
-                next_off = min(next_off, s_off)
-                if next_vaddr is None or s_vaddr < next_vaddr:
-                    next_vaddr = s_vaddr
-        if next_off - inject_off < stub_len:
-            continue
-        inject_vaddr = vaddr + filesz
-        # vaddr 侧不得与相邻段重叠
-        if next_vaddr is not None and inject_vaddr + stub_len > next_vaddr:
-            continue
-
-        new_filesz = filesz + stub_len
-        new_memsz = max(memsz, new_filesz)
-        phdr_off = elf.phoff + phdr_idx * elf.phentsize
-        return InstallPlan(
-            method=f"tail+{'init_array' if hook_label == '.init_array[0]' else 'entry'}",
-            stub_vaddr=inject_vaddr,
-            stub_file_off=inject_off,
-            stub_len=stub_len,
-            hook_off=hook_off, hook_label=hook_label, hook_orig_value=hook_orig,
-            need_phdr_grow=True, phdr_off=phdr_off,
-            new_filesz=new_filesz, new_memsz=new_memsz, notes=notes)
-
-    raise InstallError(
-        f"没有可用落点：无 ≥{stub_len} 字节的 code cave，可执行段尾 padding 也放不下")
+    return InstallPlan(
+        method=f"{space.method}+{'init_array' if hook_label == '.init_array[0]' else 'entry'}",
+        stub_vaddr=space.stub_vaddr, stub_file_off=space.stub_file_off,
+        stub_len=space.stub_len, hook_off=hook_off, hook_label=hook_label,
+        hook_orig_value=hook_orig, need_phdr_grow=space.need_phdr_grow,
+        phdr_off=space.phdr_off, new_filesz=space.new_filesz,
+        new_memsz=space.new_memsz, notes=notes)
 
 
 def apply_install(patcher: Patcher, plan: InstallPlan,
                   make_stub: Callable[[int, int], bytes]) -> int:
     """按计划写入 stub 并改 hook 点（必要时扩容段头）。返回 stub vaddr。
 
-    make_stub(stub_vaddr, hook_orig_value) 需返回恰好 plan.stub_len 字节的
+    make_stub(stub_vaddr, hook_orig_value) 需返回不超 plan.stub_len 字节的
     机器码（stub 应在结尾跳回 hook_orig_value，e_entry/.init_array 两种
     hook 语义下都是尾跳转）。
     """
@@ -158,12 +214,11 @@ def apply_install(patcher: Patcher, plan: InstallPlan,
             f"stub 长度超出计划: make_stub 返回 {len(stub)} 字节，计划上限 {plan.stub_len}"
             "（探针请用 obfuscate=False 的最长变体估算）")
 
-    # 写入 stub（tail 方案的 stub_file_off 可能落在段 filesz 之外的 padding，
-    # write_at_vaddr 的映射基于 filesz 会失败，因此直接按文件偏移写）
-    elf.data[plan.stub_file_off : plan.stub_file_off + len(stub)] = stub
-    patcher.log.append(
-        f"install stub {len(stub)}B at 0x{plan.stub_vaddr:x} (file 0x{plan.stub_file_off:x}, "
-        f"{plan.method})")
+    apply_stub_space(patcher, StubSpace(
+        method=plan.method.split("+")[0], stub_vaddr=plan.stub_vaddr,
+        stub_file_off=plan.stub_file_off, stub_len=plan.stub_len,
+        need_phdr_grow=plan.need_phdr_grow, phdr_off=plan.phdr_off,
+        new_filesz=plan.new_filesz, new_memsz=plan.new_memsz), stub)
 
     # hook 点改写为 stub 地址
     width = 8 if elf.arch == "amd64" else 4
@@ -172,18 +227,6 @@ def apply_install(patcher: Patcher, plan: InstallPlan,
     patcher.log.append(
         f"hook {plan.hook_label} (file 0x{plan.hook_off:x}): "
         f"0x{plan.hook_orig_value:x} -> 0x{plan.stub_vaddr:x}")
-
-    # 段尾兜底方案：扩容 p_filesz / p_memsz 使注入区随段加载
-    if plan.need_phdr_grow and plan.phdr_off is not None:
-        if width == 8:  # Elf64_Phdr: p_filesz@32, p_memsz@40
-            struct.pack_into("<Q", elf.data, plan.phdr_off + 32, plan.new_filesz)
-            struct.pack_into("<Q", elf.data, plan.phdr_off + 40, plan.new_memsz)
-        else:           # Elf32_Phdr: p_filesz@16, p_memsz@20
-            struct.pack_into("<I", elf.data, plan.phdr_off + 16, plan.new_filesz)
-            struct.pack_into("<I", elf.data, plan.phdr_off + 20, plan.new_memsz)
-        patcher.log.append(
-            f"grow PT_LOAD phdr@0x{plan.phdr_off:x}: filesz->0x{plan.new_filesz:x}, "
-            f"memsz->0x{plan.new_memsz:x}")
 
     if len(elf.data) != orig_size:
         raise PatchError("install must not change file size")

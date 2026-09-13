@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mistyfix"
+version = "0.2.0"
+description = "AWDP（CTF 攻防赛）PWN 方向合规漏洞修复工具"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "lief",
+    "capstone",
+    "keystone-engine",
+]
+
+[project.optional-dependencies]
+pwn = ["pwntools"]
+
+[project.scripts]
+mistyfix = "mistyfix.cli:main"
+mistyfix-gui = "mistyfix.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["mistyfix*"]

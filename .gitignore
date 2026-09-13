@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 测试/演示用二进制产物（样例源文件与测试输入除外）
+tmp/*
+!tmp/vuln
+!tmp/vuln.c
+!tmp/vuln_pie
+!tmp/exp_demo.py
+!tmp/interact_ok.py
+
+# 运行时生成
+flags.txt
+exp.py
+traffic_capture.log

@@ -288,12 +288,15 @@ def main() -> int:
         check("PIE 产物等长", out_pie.stat().st_size == pie.stat().st_size)
 
         POPUPS.clear()
-        app.free_ptr_var.set("0x404050")  # PIE + ptr：应拒绝
-        app.free_out_var.set(str(tmpdir / "vuln_pie2"))
+        app.free_ptr_var.set("0x4050")  # PIE g_ptr @ .bss：RIP 相对置空可用
+        app.free_out_var.set(str(tmpdir / "vuln_pie3"))
         app.run_fix_free()
         wait_idle(app)
-        check("PIE+ptr 被拒绝", app.last_fix_stats["applied"] == 0)
-        check("拒绝弹窗提示", POPUPS and POPUPS[0][1][0] == "修复未应用")
+        check("PIE+ptr 置空成功（RIP 相对寻址）", app.last_fix_stats["applied"] == 2)
+        out_pie3 = tmpdir / "vuln_pie3"
+        check("PIE+ptr 产物等长",
+              out_pie3.is_file()
+              and out_pie3.stat().st_size == pie.stat().st_size)
         app.autochain_var.set(True)
     else:
         print("  [SKIP] 无 PIE 样例（tmp/vuln_pie），跳过 PIE 用例")

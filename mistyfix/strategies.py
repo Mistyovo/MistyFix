@@ -226,17 +226,21 @@ def _build_free_stub(patcher: Patcher, free_plt: int, ptr_vaddr: int | None,
         # 若用 3 次 push，首次 PLT 惰性绑定时 _dl_runtime_resolve 的 movaps 会 segfault。
         lines += ["push rax", "push rcx", "push rdx", "push rdi"]
         if pie:
-            # PIE 下运行时基址未知，绝对地址不可用；直接 rel32 call free@plt，
+            # PIE 下运行时基址未知，绝对 call 不可用；直接 rel32 call free@plt，
             # 以 stub 落点地址（cave vaddr）为基汇编，加载后平移关系不变。
             lines.append(f"call {free_plt:#x}")
         else:
             lines.append(f"mov rax, {free_plt:#x}")  # 绝对地址，stub 位置无关
             lines.append("call rax")
         if ptr_vaddr is not None:
-            # keystone 会把 [绝对地址] 汇编成 RIP 相对寻址且基址错误，
-            # 必须经寄存器做绝对寻址（rax 在 call 后已不再需要）
-            lines.append(f"mov rax, {ptr_vaddr:#x}")
-            lines.append("mov qword ptr [rax], 0")
+            if pie:
+                # PIE 置空同样可行：keystone 以 stub 落点为基汇编 [绝对地址] 时
+                # 自动编码为 RIP 相对寻址，cave→.data 的差值随 ASLR 平移不变
+                lines.append(f"mov qword ptr [{ptr_vaddr:#x}], 0")
+            else:
+                # 非 PIE 走寄存器绝对寻址（keystone vaddr=0 时 RIP 相对基址错误）
+                lines.append(f"mov rax, {ptr_vaddr:#x}")
+                lines.append("mov qword ptr [rax], 0")
         lines += ["pop rdi", "pop rdx", "pop rcx", "pop rax"]
     else:  # i386
         lines += ["push eax", "push ecx", "push edx", "push edi"]
@@ -254,19 +258,13 @@ def true_fix_free(patcher: Patcher, call_vaddr: int, ptr_vaddr: int | None = Non
     stub：保存现场 -> 正常 call free@plt -> 可选将指针变量置空（防 UAF）->
     恢复现场 -> 执行被覆盖的原指令 -> jmp 回去。绝不 NOP 掉 call free。
 
-    PIE（ET_DYN）二进制：stub 内用 rel32 call free@plt（以 cave 落点为基），
-    随加载基址平移依然正确；指针置空依赖绝对数据地址，PIE 下不可用
-    （会返回 applied=False 并说明原因）。
+    PIE（ET_DYN）二进制：call 与指针置空均以 cave 落点为基汇编成 RIP 相对
+    寻址（keystone 在给定 addr 时对 [绝对地址] 自动生成 rel32 RIP 相对编码），
+    偏移随加载基址平移不变，PIE 下同样完整可用。
     """
     if (bad := _check_arch(patcher.elf.arch, "true_fix_free")) is not None:
         return bad
     pie = patcher.elf.is_pie
-    if pie and ptr_vaddr is not None:
-        return _fail(
-            "true_fix_free: PIE binaries cannot null the pointer variable -- "
-            "absolute data addressing is unavailable under ASLR; "
-            "retry without --ptr (the free() call itself is still truly fixed)"
-        )
 
     try:
         free_plt = patcher.elf.plt_stub_addr("free")
@@ -308,7 +306,10 @@ def true_fix_free(patcher: Patcher, call_vaddr: int, ptr_vaddr: int | None = Non
         "free is genuinely called (no NOP); injected into existing code cave, section table/file size unchanged",
     ]
     if ptr_vaddr is not None:
-        changes.append("note: absolute addressing of the pointer variable assumes a non-PIE/fixed-address binary")
+        changes.append(
+            "note: pointer nulling uses "
+            + ("RIP-relative addressing relative to the cave (PIE-safe)" if pie
+               else "absolute addressing (non-PIE fixed address)"))
     return PatchPlan(
         description=(
             f"true-fix free at 0x{call_vaddr:x} via trampoline to cave 0x{cave_vaddr:x}"

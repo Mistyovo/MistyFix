@@ -20,3 +20,5 @@ traffic_capture.log
 
 # PyInstaller 自动生成的 spec（便携构建入口见 build_release.py）
 *.spec
+tmp/pie_r*
+tmp/seccomp_check*.sh
